@@ -1,0 +1,184 @@
+# Aggressive one-time image compression for lishuhang/img repo
+# v2.1 (2026-07-04)
+#
+# Strategy (IE6-compatible: only jpg/png/gif):
+#   - Opaque PNG → convert to JPG (50-90% savings, e.g. 624KB→62KB)
+#   - Transparent PNG → keep PNG, oxipng -o 6 (lossless)
+#   - JPEG → jpegoptim --max=85 (near-lossless)
+#   - GIF → gifsicle -O3 --lossy=90 (lossy, keeps animation)
+#   - No WebP/AVIF (IE6 compat)
+#
+# Outputs extension_changes.json artifact for URL sync in blog/daily repos.
+name: Aggressive Compress (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_size_kb:
+        description: 'Only process images larger than N KB (0 = all)'
+        required: false
+        default: '50'
+
+permissions:
+  contents: write
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jpegoptim gifsicle imagemagick python3-pip
+          # oxipng from GitHub releases
+          OXIPNG_VERSION="9.1.5"
+          curl -sSL "https://github.com/shssoichiro/oxipng/releases/download/v${OXIPNG_VERSION}/oxipng-${OXIPNG_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o /tmp/oxipng.tar.gz
+          tar -xzf /tmp/oxipng.tar.gz -C /tmp
+          sudo mv /tmp/oxipng-${OXIPNG_VERSION}-x86_64-unknown-linux-musl/oxipng /usr/local/bin/
+          sudo chmod +x /usr/local/bin/oxipng
+          # Pillow for transparency detection
+          pip3 install --user Pillow
+
+      - name: Verify tools
+        run: |
+          oxipng --version
+          jpegoptim --version 2>&1 | head -1
+          gifsicle --version 2>&1 | head -1
+          python3 -c "from PIL import Image; print('Pillow OK')"
+
+      - name: Run aggressive compression
+        env:
+          MIN_SIZE: ${{ inputs.min_size_kb }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, subprocess, sys
+          from PIL import Image
+
+          MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE', '50')) * 1024
+          changes = {}  # "year/month/day/slug/01.png" → "year/month/day/slug/01.jpg"
+          stats = {'png_opaque_to_jpg': 0, 'png_transparent_kept': 0, 'jpeg_compressed': 0, 'gif_compressed': 0, 'skipped_small': 0, 'errors': 0}
+          total_saved = 0
+
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root: continue
+              for fname in files:
+                  path = os.path.join(root, fname)
+                  ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+                  if ext not in ('png', 'jpg', 'jpeg', 'gif'):
+                      continue
+                  
+                  size_before = os.path.getsize(path)
+                  if size_before < MIN_SIZE_BYTES:
+                      stats['skipped_small'] += 1
+                      continue
+                  
+                  rel_path = os.path.relpath(path, '.')
+                  
+                  try:
+                      if ext == 'png':
+                          img = Image.open(path)
+                          # Detect transparency
+                          has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+                          is_opaque = True
+                          if has_alpha:
+                              if img.mode == 'P':
+                                  img = img.convert('RGBA')
+                              if img.mode == 'RGBA':
+                                  alpha = img.getchannel('A')
+                                  # If any pixel has alpha < 255, it's transparent
+                                  if alpha.getextrema()[0] < 255:
+                                      is_opaque = False
+                          
+                          if is_opaque:
+                              # Opaque PNG → convert to JPG
+                              new_path = path.rsplit('.', 1)[0] + '.jpg'
+                              img_rgb = img.convert('RGB')
+                              img_rgb.save(new_path, 'JPEG', quality=88, optimize=True, progressive=True)
+                              new_size = os.path.getsize(new_path)
+                              if new_size < size_before:
+                                  os.remove(path)
+                                  changes[rel_path] = os.path.relpath(new_path, '.')
+                                  total_saved += size_before - new_size
+                                  stats['png_opaque_to_jpg'] += 1
+                              else:
+                                  # JPG wasn't smaller, keep PNG but oxipng it
+                                  os.remove(new_path)
+                                  subprocess.run(['oxipng', '-o', '6', '--strip', 'safe', '--force', path], capture_output=True, timeout=300)
+                                  new_size2 = os.path.getsize(path)
+                                  total_saved += size_before - new_size2
+                                  stats['png_transparent_kept'] += 1
+                          else:
+                              # Transparent PNG → keep, oxipng -o 6
+                              subprocess.run(['oxipng', '-o', '6', '--strip', 'safe', '--force', path], capture_output=True, timeout=300)
+                              new_size = os.path.getsize(path)
+                              total_saved += size_before - new_size
+                              stats['png_transparent_kept'] += 1
+                      
+                      elif ext in ('jpg', 'jpeg'):
+                          subprocess.run(['jpegoptim', '--max=85', '--strip-all', '--all-progressive', '-f', path], capture_output=True, timeout=60)
+                          new_size = os.path.getsize(path)
+                          total_saved += size_before - new_size
+                          stats['jpeg_compressed'] += 1
+                      
+                      elif ext == 'gif':
+                          tmp = path + '.tmp'
+                          r = subprocess.run(['gifsicle', '-O3', '--lossy=90', '--no-extensions', '-o', tmp, path], capture_output=True, timeout=180)
+                          if r.returncode == 0 and os.path.exists(tmp):
+                              if os.path.getsize(tmp) < size_before:
+                                  os.replace(tmp, path)
+                                  total_saved += size_before - os.path.getsize(path)
+                              else:
+                                  os.remove(tmp)
+                          stats['gif_compressed'] += 1
+                  
+                  except Exception as e:
+                      print(f'ERROR {rel_path}: {e}', file=sys.stderr)
+                      stats['errors'] += 1
+
+          # Save manifest
+          with open('extension_changes.json', 'w') as f:
+              json.dump(changes, f, indent=2, ensure_ascii=False)
+          
+          print(f'\n=== Compression Summary ===')
+          print(f'Opaque PNG → JPG: {stats["png_opaque_to_jpg"]}')
+          print(f'Transparent PNG kept: {stats["png_transparent_kept"]}')
+          print(f'JPEG compressed: {stats["jpeg_compressed"]}')
+          print(f'GIF compressed: {stats["gif_compressed"]}')
+          print(f'Skipped (small): {stats["skipped_small"]}')
+          print(f'Errors: {stats["errors"]}')
+          print(f'Extension changes: {len(changes)}')
+          print(f'Total saved: {total_saved/1024/1024:.1f} MB')
+          print(f'\nManifest saved to extension_changes.json')
+          PYEOF
+
+      - name: Commit compressed images
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "compress: aggressive one-time compression
+
+          - Opaque PNG → JPG (50-90% savings)
+          - Transparent PNG → oxipng -o 6 (lossless)
+          - JPEG → jpegoptim --max=85
+          - GIF → gifsicle --lossy=90
+          - IE6 compatible (no webp/avif)
+          - Extension changes recorded in extension_changes.json"
+            git push
+            echo "Committed and pushed."
+          fi
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-changes
+          path: extension_changes.json
+          retention-days: 90
