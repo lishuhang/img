@@ -4,7 +4,7 @@
 # Manually triggered (workflow_dispatch) or runs on push to master.
 # Compresses PNG/JPEG/GIF losslessly, commits + pushes if savings > 1MB.
 #
-# Tools: oxipng (PNG), jpegoptim (JPEG), gifsicle (GIF)
+# Tools: oxipng (PNG, from GitHub releases), jpegoptim (JPEG, apt), gifsicle (GIF, apt)
 # Typical savings: 15-40% with zero visible quality loss.
 name: Compress Images
 
@@ -42,8 +42,16 @@ jobs:
 
       - name: Install compression tools
         run: |
+          # jpegoptim and gifsicle are in apt
           sudo apt-get update
-          sudo apt-get install -y oxipng jpegoptim gifsicle
+          sudo apt-get install -y jpegoptim gifsicle
+          # oxipng: install from GitHub releases (not in apt)
+          OXIPNG_VERSION="9.1.5"
+          curl -sSL "https://github.com/shssoichiro/oxipng/releases/download/v${OXIPNG_VERSION}/oxipng-${OXIPNG_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -o /tmp/oxipng.tar.gz
+          tar -xzf /tmp/oxipng.tar.gz -C /tmp
+          sudo mv /tmp/oxipng-${OXIPNG_VERSION}-x86_64-unknown-linux-musl/oxipng /usr/local/bin/
+          sudo chmod +x /usr/local/bin/oxipng
 
       - name: Verify tools
         run: |
@@ -51,20 +59,12 @@ jobs:
           jpegoptim --version 2>&1 | head -1
           gifsicle --version 2>&1 | head -1
 
-      - name: Copy compress script
-        run: |
-          cat > /tmp/compress_images.py << 'PYEOF'
-          # The compress_images.py content will be added by keepitrun v2.0
-          # For now, inline a minimal version
-          PYEOF
-
       - name: Run compression (dispatch)
         if: github.event_name == 'workflow_dispatch'
         env:
           MIN_SIZE: ${{ inputs.min_size_kb }}
           YEAR_FILTER: ${{ inputs.year_filter }}
         run: |
-          # Use inline compression (script not yet in img repo)
           set -e
           echo "=== Scanning images ==="
           find . -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" \) \
