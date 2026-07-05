@@ -1,0 +1,119 @@
+# Find and archive unused images (one-time, v1.11)
+# Scans all images in img repo, checks if referenced by any blog or daily post.
+# Unused images are moved to _archived/img/... (preserving path).
+name: Archive Unused Images (one-time)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch blog and daily post references
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Download all blog _posts
+          mkdir -p /tmp/blog_posts /tmp/daily_posts
+          gh api repos/lishuhang/lishuhang.github.io/git/trees/main?recursive=1 --jq '.tree[] | select(.path | startswith("_posts/")) | .path' > /tmp/blog_post_paths.txt
+          while read p; do
+            fname=$(basename "$p")
+            curl -sSL "https://raw.githubusercontent.com/lishuhang/lishuhang.github.io/main/$p" -o "/tmp/blog_posts/$fname"
+          done < /tmp/blog_post_paths.txt
+          
+          # Download all daily _posts
+          gh api repos/lishuhang/daily/git/trees/main?recursive=1 --jq '.tree[] | select(.path | startswith("_posts/")) | .path' > /tmp/daily_post_paths.txt
+          while read p; do
+            fname=$(basename "$p")
+            curl -sSL "https://raw.githubusercontent.com/lishuhang/daily/main/$p" -o "/tmp/daily_posts/$fname"
+          done < /tmp/daily_post_paths.txt
+          
+          echo "Blog posts: $(ls /tmp/blog_posts | wc -l)"
+          echo "Daily posts: $(ls /tmp/daily_posts | wc -l)"
+
+      - name: Find and archive unused images
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json, shutil
+
+          # Collect all image paths referenced in posts
+          referenced = set()
+          for posts_dir in ['/tmp/blog_posts', '/tmp/daily_posts']:
+              for fname in os.listdir(posts_dir):
+                  fpath = os.path.join(posts_dir, fname)
+                  with open(fpath, 'r', errors='replace') as f:
+                      content = f.read()
+                  # Find all image path references
+                  # Patterns: /YYYY/MM/..., image: /YYYY/..., ![](/YYYY/...)
+                  for m in re.finditer(r'/(\d{4}/\d{2}/[^\s)"\']+)', content):
+                      referenced.add(m.group(1))
+                  # Also raw.githubusercontent patterns (just in case any remain)
+                  for m in re.finditer(r'raw\.githubusercontent\.com/lishuhang/img/(?:master|main)/(\d{4}/[^\s)"\']+)', content):
+                      referenced.add(m.group(1))
+
+          print(f'Referenced image paths: {len(referenced)}')
+
+          # Scan all images in repo
+          all_images = []
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root or '_archived' in root or '.github' in root: continue
+              for f in files:
+                  ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
+                  if ext in ('png', 'jpg', 'jpeg', 'gif', 'webp', 'avif'):
+                      rel = os.path.relpath(os.path.join(root, f), '.')
+                      all_images.append(rel)
+
+          print(f'Total images in repo: {len(all_images)}')
+
+          # Find unused
+          unused = []
+          for img_path in all_images:
+              if img_path not in referenced:
+                  unused.append(img_path)
+
+          print(f'Unused images: {len(unused)}')
+          
+          # Move to _archived/img/...
+          moved = 0
+          for img_path in unused:
+              dest = os.path.join('_archived', 'img', img_path)
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.move(img_path, dest)
+              moved += 1
+
+          print(f'Moved: {moved} images to _archived/img/')
+
+          # Save manifest
+          with open('archived_images.json', 'w') as f:
+              json.dump(unused, f, indent=2, ensure_ascii=False)
+          PYEOF
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No unused images found"
+          else
+            git commit -m "archive: move unused images to _archived/img/
+
+          Scanned all images against blog + daily post references.
+          Moved unused images to _archived/img/ preserving path structure.
+          Can be restored if needed."
+            git push
+            echo "Committed and pushed."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archived-images
+          path: archived_images.json
