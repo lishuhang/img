@@ -1,0 +1,107 @@
+# Convert webp/avif images to jpg/png (one-time, v1.11)
+# IE6 compatible: only jpg/png/gif
+name: Convert WebP/AVIF (one-time)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick python3-pip
+          pip3 install --user Pillow
+
+      - name: Convert webp/avif to jpg/png
+        run: |
+          python3 << 'PYEOF'
+          import os, json, subprocess
+          from PIL import Image
+
+          changes = {}  # old_path → new_path
+          stats = {'webp_to_jpg': 0, 'webp_to_png': 0, 'avif_to_jpg': 0, 'avif_to_png': 0, 'errors': 0}
+
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root: continue
+              for fname in files:
+                  ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+                  if ext not in ('webp', 'avif'): continue
+                  
+                  path = os.path.join(root, fname)
+                  rel_path = os.path.relpath(path, '.')
+                  
+                  try:
+                      img = Image.open(path)
+                      has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+                      is_transparent = False
+                      if has_alpha:
+                          if img.mode == 'P':
+                              img = img.convert('RGBA')
+                          if img.mode == 'RGBA':
+                              alpha = img.getchannel('A')
+                              if alpha.getextrema()[0] < 255:
+                                  is_transparent = True
+                      
+                      if is_transparent:
+                          # Transparent → PNG
+                          new_path = path.rsplit('.', 1)[0] + '.png'
+                          img.save(new_path, 'PNG', optimize=True)
+                          new_ext = 'png'
+                          stats[f'{ext}_to_png'] += 1
+                      else:
+                          # Opaque → JPG
+                          new_path = path.rsplit('.', 1)[0] + '.jpg'
+                          img.convert('RGB').save(new_path, 'JPEG', quality=88, optimize=True, progressive=True)
+                          new_ext = 'jpg'
+                          stats[f'{ext}_to_jpg'] += 1
+                      
+                      os.remove(path)
+                      changes[rel_path] = rel_path.rsplit('.', 1)[0] + '.' + new_ext
+                      print(f'Converted: {rel_path} → {changes[rel_path]}')
+                  except Exception as e:
+                      print(f'ERROR: {rel_path}: {e}')
+                      stats['errors'] += 1
+
+          with open('webp_avif_changes.json', 'w') as f:
+              json.dump(changes, f, indent=2, ensure_ascii=False)
+
+          print(f'\n=== Conversion Summary ===')
+          print(f'WebP → JPG: {stats["webp_to_jpg"]}')
+          print(f'WebP → PNG: {stats["webp_to_png"]}')
+          print(f'AVIF → JPG: {stats["avif_to_jpg"]}')
+          print(f'AVIF → PNG: {stats["avif_to_png"]}')
+          print(f'Errors: {stats["errors"]}')
+          print(f'Total changes: {len(changes)}')
+          PYEOF
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "convert: webp/avif → jpg/png (IE6 compatible, one-time)
+
+          - Opaque → JPG (quality 88)
+          - Transparent → PNG
+          - 90 webp/avif images converted
+          - Extension changes in webp_avif_changes.json"
+            git push
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webp-avif-changes
+          path: webp_avif_changes.json
